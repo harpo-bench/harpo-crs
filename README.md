@@ -222,7 +222,7 @@ Ensure `--num_processes` matches the number of GPUs requested (e.g., 2 GPUs → 
 ```bash
 python scripts/evaluate.py \
     --checkpoint outputs/redial/checkpoints/final \
-    --test-data data/redial/test.json \
+    --test-data data/redial/test_sft.json \
     --output results/redial
 ```
 
