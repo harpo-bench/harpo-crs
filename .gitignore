@@ -75,3 +75,4 @@ Thumbs.db
 
 # Raw ReDial (downloaded by scripts/convert_redial.py)
 redial_raw/
+redial_data/

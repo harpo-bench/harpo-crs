@@ -115,7 +115,8 @@ Scores on 1–5 scale. κ = Fleiss' kappa. 200 samples rated by 3 annotators.
 ## Reproduce (ReDial)
 
 ```bash
-DATA=/path/to/redial_data OUT=./harpo_out bash reproduce.sh
+tar xzf data/redial_data.tar.gz
+DATA=./redial_data OUT=./harpo_out bash reproduce.sh
 ```
 
 Standard ReDial test, full 6,630-movie catalogue: R@1 8.64 · R@10 30.05 · R@50 49.99 · MRR 0.156.
