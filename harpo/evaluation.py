@@ -23,9 +23,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from config import VTO, Domain, EvaluationResult, SPECIAL_TOKENS
-from model import HARPOMTv2
-from training import SFTDataset, PreferenceDataset
+from .config import VTO, Domain, EvaluationResult, SPECIAL_TOKENS
+from .model import HARPOMTv2
+from .training import SFTDataset, PreferenceDataset
 
 
 # ============================================================================

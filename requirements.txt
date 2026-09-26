@@ -1,10 +1,12 @@
 # HARPO: Hierarchical Agentic Reasoning with Preference Optimization
 # Requirements for ACL 2025 Submission
 
-# Core ML
-torch
-transformers
-accelerate
+# Core ML (tested: torch 2.5.1+cu121 and 2.14, transformers 5.17.0, peft 0.21.0,
+# accelerate 1.10.1 and 1.15)
+torch>=2.5.1
+transformers==5.17.0
+peft==0.21.0
+accelerate>=1.10.1
 datasets
 tokenizers
 

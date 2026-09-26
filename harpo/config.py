@@ -356,6 +356,46 @@ class MAVENConfig:
 
 
 # ============================================================================
+# RETRIEVAL CONFIGURATION
+# ============================================================================
+
+@dataclass
+class RetrievalConfig:
+    """Configuration for the item retriever.
+
+    No counterpart existed in the original code: nothing in the four-stage
+    curriculum trained the model to rank items, despite Recall@K being the
+    headline metric.
+    """
+    enabled: bool = True
+    embed_dim: int = 256
+    dropout: float = 0.1
+    temperature: float = 0.07
+    loss_weight: float = 1.0
+
+    # Content-only ignores the collaborative signal in ~10k ReDial dialogues;
+    # id-only cannot generalise to unseen items. "hybrid" fuses both.
+    item_representation: str = "hybrid"      # "content" | "id" | "hybrid"
+    id_embedding_weight: float = 0.5
+    max_catalog_size: int = 20000
+    item_max_length: int = 48
+
+    # In-batch negatives alone are weak and popularity-biased.
+    num_hard_negatives: int = 4
+    hard_negative_start_epoch: int = 0
+    popularity_debias: float = 0.5
+
+    # Per-item logit bias initialised to log training frequency (logit
+    # adjustment). Ranking then starts at the popularity baseline -- which beats
+    # every dialogue-blind scorer on ReDial -- and the retriever only has to
+    # learn what the dialogue adds on top.
+    item_bias: bool = True
+
+    use_reranker: bool = False
+    rerank_top_k: int = 50
+
+
+# ============================================================================
 # TRAINING CONFIGURATION
 # ============================================================================
 
@@ -410,6 +450,7 @@ class TrainingConfig:
     charm_config: CHARMConfig = field(default_factory=CHARMConfig)
     bridge_config: BRIDGEConfig = field(default_factory=BRIDGEConfig)
     maven_config: MAVENConfig = field(default_factory=MAVENConfig)
+    retrieval_config: RetrievalConfig = field(default_factory=RetrievalConfig)
 
 
 # ============================================================================

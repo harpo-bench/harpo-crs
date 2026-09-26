@@ -112,6 +112,14 @@ Scores on 1–5 scale. κ = Fleiss' kappa. 200 samples rated by 3 annotators.
 
 ---
 
+## Reproduce (ReDial)
+
+```bash
+DATA=/path/to/redial_data OUT=./harpo_out bash reproduce.sh
+```
+
+Standard ReDial test, full 6,630-movie catalogue: R@1 8.64 · R@10 30.05 · R@50 49.99 · MRR 0.156.
+
 ## Repository Structure
 
 ```
@@ -119,7 +127,7 @@ harpo/
 ├── README.md
 ├── requirements.txt
 ├── setup.py
-├── src/
+├── harpo/
 │   ├── __init__.py
 │   ├── config.py
 │   ├── model.py
@@ -317,7 +325,7 @@ explanation = explainer.explain(context, response)
 ### REST API
 
 ```bash
-python -m uvicorn src.api_server:app --host 0.0.0.0 --port 8000
+python -m uvicorn harpo.api_server:app --host 0.0.0.0 --port 8000
 ```
 
 Endpoints: `POST /evaluate` · `POST /batch-evaluate` · `POST /compare` · `POST /explain` · `GET /health`

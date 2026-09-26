@@ -16,14 +16,16 @@ Primary Objective: USER-ALIGNED RECOMMENDATION QUALITY
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, field
 import math
 import heapq
 
-from config import (
+from .pooling import masked_mean_pool
+from .retrieval import CrossEncoderReranker, TwoTowerRetriever
+from .config import (
     VTO, Domain, AgentRole, ModelConfig, TrainingConfig,
-    STARConfig, CHARMConfig, BRIDGEConfig, MAVENConfig,
+    STARConfig, CHARMConfig, BRIDGEConfig, MAVENConfig, RetrievalConfig,
     SPECIAL_TOKENS, get_domain_token
 )
 
@@ -38,6 +40,7 @@ class ModelOutput:
     reward_scores: Optional[Dict[str, torch.Tensor]] = None
     recommendation_scores: Optional[torch.Tensor] = None
     reasoning_path: Optional[List] = None
+    context_pooled: Optional[torch.Tensor] = None
     
     def to_dict(self):
         """Convert to dictionary for DataParallel compatibility"""
@@ -48,7 +51,8 @@ class ModelOutput:
             'vto_logits': self.vto_logits,
             'reward_scores': self.reward_scores,
             'recommendation_scores': self.recommendation_scores,
-            'reasoning_path': self.reasoning_path
+            'reasoning_path': self.reasoning_path,
+            'context_pooled': self.context_pooled
         }
     
     @classmethod
@@ -122,11 +126,12 @@ class BRIDGE(nn.Module):
         )
         
         # Domain gates
+        # One row per domain so a batch spanning several domains can be gated
+        # per sample. The old ParameterDict keyed by Domain.value could only
+        # apply a single domain to an entire batch.
         if config.use_domain_gates:
-            self.domain_gates = nn.ParameterDict({
-                domain.value: nn.Parameter(torch.ones(hidden_size) * config.gate_init)
-                for domain in Domain
-            })
+            self.domain_gates = nn.Parameter(
+                torch.full((num_domains, hidden_size), float(config.gate_init)))
         
         # NEW: Contrastive projection for cross-domain alignment
         self.contrastive_proj = nn.Sequential(
@@ -144,9 +149,23 @@ class BRIDGE(nn.Module):
         
         self.output_norm = nn.LayerNorm(hidden_size)
     
-    def forward(self, hidden_states: torch.Tensor, domain: Domain,
+    @staticmethod
+    def _as_domain_ids(domain: Union[Domain, torch.Tensor],
+                       batch_size: int, device) -> torch.Tensor:
+        """Normalise a Domain enum or an id tensor to a ``[batch]`` LongTensor."""
+        if isinstance(domain, torch.Tensor):
+            ids = domain.to(device=device, dtype=torch.long).reshape(-1)
+            if ids.numel() == 1 and batch_size > 1:
+                ids = ids.expand(batch_size)
+            return ids
+        return torch.full((batch_size,), list(Domain).index(domain),
+                          dtype=torch.long, device=device)
+
+    def forward(self, hidden_states: torch.Tensor,
+                domain: Union[Domain, torch.Tensor],
                 alpha: float = 1.0, vto_labels: Optional[torch.Tensor] = None,
-                enable_contrastive: bool = True
+                enable_contrastive: bool = True,
+                attention_mask: Optional[torch.Tensor] = None
                ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for domain adaptation.
@@ -158,11 +177,10 @@ class BRIDGE(nn.Module):
         device = hidden_states.device
         dtype = hidden_states.dtype
         
-        # Pool if sequence
-        if hidden_states.dim() == 3:
-            pooled = hidden_states.mean(dim=1)
-        else:
-            pooled = hidden_states
+        # Masked, so padding cannot leak into the representation.
+        pooled = masked_mean_pool(hidden_states, attention_mask)
+        batch_size = pooled.size(0)
+        domain_ids = self._as_domain_ids(domain, batch_size, device)
         
         # Multi-head projection
         head_outputs = [head(pooled) for head in self.projection_heads]
@@ -170,8 +188,8 @@ class BRIDGE(nn.Module):
         projected = self.head_combiner(combined)
         
         # Apply domain gate
-        if self.config.use_domain_gates and domain.value in self.domain_gates:
-            gate = torch.sigmoid(self.domain_gates[domain.value])
+        if self.config.use_domain_gates:
+            gate = torch.sigmoid(self.domain_gates[domain_ids])
             domain_invariant = gate * projected + (1 - gate) * pooled
         else:
             domain_invariant = projected
@@ -199,9 +217,7 @@ class BRIDGE(nn.Module):
             reversed_features = domain_invariant
         
         domain_logits = self.domain_discriminator(reversed_features)
-        domain_idx = list(Domain).index(domain)
-        domain_labels = torch.full((batch_size,), domain_idx, dtype=torch.long, device=device)
-        outputs["domain_loss"] = F.cross_entropy(domain_logits, domain_labels)
+        outputs["domain_loss"] = F.cross_entropy(domain_logits, domain_ids)
         
         # NEW: Contrastive projection for cross-domain alignment
         if enable_contrastive and batch_size > 1:
@@ -216,7 +232,7 @@ class BRIDGE(nn.Module):
         
         # Task preservation loss
         if vto_labels is not None:
-            vto_logits = self.task_preserver(pooled)
+            vto_logits = self.task_preserver(domain_invariant)
             outputs["task_loss"] = F.binary_cross_entropy_with_logits(vto_logits, vto_labels.float())
             outputs["vto_logits"] = vto_logits
         
@@ -932,6 +948,85 @@ class HARPOMTv2(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_size // 2, 1)
         )
+
+        # Item retriever: the missing contrastive objective.
+        retrieval_config = getattr(training_config, "retrieval_config", None)
+        self.retrieval_config = retrieval_config
+        if retrieval_config is not None and retrieval_config.enabled:
+            self.retriever = TwoTowerRetriever(
+                hidden_size, embed_dim=retrieval_config.embed_dim,
+                dropout=retrieval_config.dropout,
+                init_temperature=retrieval_config.temperature,
+            )
+            if retrieval_config.item_representation in ("id", "hybrid"):
+                self.item_id_embedding = nn.Embedding(
+                    retrieval_config.max_catalog_size, retrieval_config.embed_dim
+                )
+                nn.init.normal_(self.item_id_embedding.weight, std=0.02)
+            else:
+                self.item_id_embedding = None
+            # Zero until a catalogue is attached, when it is set to log popularity.
+            if getattr(retrieval_config, "item_bias", False):
+                self.item_bias = nn.Embedding(retrieval_config.max_catalog_size, 1)
+                nn.init.zeros_(self.item_bias.weight)
+            else:
+                self.item_bias = None
+            self.reranker = (CrossEncoderReranker(hidden_size, retrieval_config.dropout)
+                             if retrieval_config.use_reranker else None)
+        else:
+            self.retriever = None
+            self.item_id_embedding = None
+            self.item_bias = None
+            self.reranker = None
+
+    def encode_item_embeddings(self, item_pooled: torch.Tensor,
+                               item_indices: Optional[torch.Tensor] = None
+                              ) -> torch.Tensor:
+        """Item embeddings, fusing the learned id table with the text tower.
+
+        Items outside the table (index < 0) fall back to content only rather
+        than erroring.
+        """
+        if self.retriever is None:
+            raise RuntimeError("retrieval is disabled in this configuration")
+
+        embeds = self.retriever.encode_item(item_pooled)
+        cfg = self.retrieval_config
+        if self.item_id_embedding is None or item_indices is None:
+            return embeds
+        if cfg.item_representation == "content":
+            return embeds
+
+        known = (item_indices >= 0) & (item_indices < self.item_id_embedding.num_embeddings)
+        if not bool(known.any()):
+            return embeds
+
+        safe = item_indices.clamp(min=0, max=self.item_id_embedding.num_embeddings - 1)
+        id_embeds = F.normalize(self.item_id_embedding(safe), dim=-1)
+
+        if cfg.item_representation == "id":
+            fused = torch.where(known.unsqueeze(-1), id_embeds, embeds)
+        else:
+            w = cfg.id_embedding_weight
+            fused = torch.where(known.unsqueeze(-1),
+                                (1.0 - w) * embeds + w * id_embeds, embeds)
+        return F.normalize(fused, dim=-1)
+
+    @staticmethod
+    def _per_example_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Mean NLL per example, ``[batch]``.
+
+        ``outputs.loss`` is already reduced over the batch, so it cannot be a
+        per-example signal; broadcasting it gave every row the same target.
+        """
+        shift_logits = logits[:, :-1, :]
+        shift_labels = labels[:, 1:]
+        nll = F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1), ignore_index=-100, reduction="none",
+        ).view(shift_labels.shape)
+        valid = (shift_labels != -100).to(nll.dtype)
+        return (nll * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
     
     def load_base_model(self, device: str = None):
         """Load base LLM with LoRA, Flash Attention 2, and proper special token handling
@@ -975,8 +1070,11 @@ class HARPOMTv2(nn.Module):
             print(f"✓ Detected LoRA adapter checkpoint")
         
         # ===== Set offline mode for HuggingFace =====
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        # Only when genuinely loading from disk: hard-coding these made the
+        # documented "fresh start (requires internet)" branch impossible.
+        if is_local_path:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
         
         # ===== Determine dtype and check for Flash Attention 2 =====
         model_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
@@ -998,51 +1096,47 @@ class HARPOMTv2(nn.Module):
                 print("=" * 50)
         
         # ===== Load tokenizer =====
-        if is_local_path:
-            # Load tokenizer from checkpoint - it already has special tokens
-            print(f"Loading tokenizer from local path...")
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-                padding_side="left",
-                local_files_only=True
-            )
-            print(f"✓ Loaded tokenizer with {len(self.tokenizer)} tokens (special tokens already included)")
-            new_tokens = []  # Don't add tokens - they're already in checkpoint
-        else:
-            # Fresh start - load from HuggingFace (requires internet)
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-                padding_side="left"
-            )
-            
-            # ===== Add ALL special tokens used in training data =====
-            special_tokens_to_add = [
-                "<|vto_start|>", "<|vto_end|>",
-                "<|tool_start|>", "<|tool_end|>",
-                "<|think|>", "<|/think|>",
-                "<|thought|>", "<|/thought|>",
-                "<|response|>", "<|/response|>",
-                "<|domain:fashion|>", "<|domain:movies|>", 
-                "<|domain:electronics|>", "<|domain:general|>",
-                "<|domain:food|>", "<|domain:books|>",
-                "<|agent:recommender|>", "<|agent:critic|>", 
-                "<|agent:explainer|>", "<|agent:orchestrator|>",
-            ]
-            
-            # Check which tokens are truly new
-            new_tokens = []
-            for token in special_tokens_to_add:
-                if token not in self.tokenizer.get_vocab():
-                    new_tokens.append(token)
-            
-            if new_tokens:
-                num_added = self.tokenizer.add_special_tokens({
-                    'additional_special_tokens': new_tokens
-                })
-                print(f"✓ Added {num_added} special tokens to tokenizer")
-        
+        # A local path is not necessarily a HARPO checkpoint: a plain model
+        # directory (a hub snapshot copied to a cluster node) has no special
+        # tokens. Assuming it did skipped them entirely, so the same data was
+        # tokenized differently depending on where the weights came from. The
+        # missing-token check below is a no-op for checkpoints that have them.
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            padding_side="left",
+            local_files_only=is_local_path
+        )
+        # Dialogues overflow from the start: the latest turns carry the request,
+        # and right-truncation also cut the reply off 15% of SFT examples.
+        self.tokenizer.truncation_side = "left"
+
+        # ===== Add ALL special tokens used in training data =====
+        special_tokens_to_add = [
+            "<|vto_start|>", "<|vto_end|>",
+            "<|tool_start|>", "<|tool_end|>",
+            "<|think|>", "<|/think|>",
+            "<|thought|>", "<|/thought|>",
+            "<|response|>", "<|/response|>",
+            "<|domain:fashion|>", "<|domain:movies|>", 
+            "<|domain:electronics|>", "<|domain:general|>",
+            "<|domain:food|>", "<|domain:books|>",
+            "<|agent:recommender|>", "<|agent:critic|>", 
+            "<|agent:explainer|>", "<|agent:orchestrator|>",
+        ]
+
+        # Check which tokens are truly new
+        new_tokens = []
+        for token in special_tokens_to_add:
+            if token not in self.tokenizer.get_vocab():
+                new_tokens.append(token)
+
+        if new_tokens:
+            num_added = self.tokenizer.add_special_tokens({
+                'additional_special_tokens': new_tokens
+            })
+            print(f"✓ Added {num_added} special tokens to tokenizer")
+
         # Add pad token if missing (for both cases)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -1052,7 +1146,7 @@ class HARPOMTv2(nn.Module):
         load_kwargs = {
             "trust_remote_code": True,
             "torch_dtype": model_dtype,
-            "local_files_only": True,  # CRITICAL: Always try local first for offline support
+            "local_files_only": is_local_path,
         }
         
         # Add Flash Attention 2 if available
@@ -1137,16 +1231,39 @@ class HARPOMTv2(nn.Module):
                 self.base_model.resize_token_embeddings(len(self.tokenizer))
                 new_embeddings_size = self.base_model.get_input_embeddings().weight.shape[0]
                 print(f"✓ Resized embeddings: {old_embeddings_size} -> {new_embeddings_size}")
-                
-                # Initialize new embeddings with mean of existing embeddings for stability
+
+                # Initialise the rows of the tokens actually added, by id rather
+                # than by the change in matrix size. The size delta is the wrong
+                # signal: Qwen2.5 pads its vocabulary to 151936 while holding
+                # 151665 real tokens, so adding 20 tokens *shrinks* the matrix to
+                # 151685 and range(old, new) is empty -- the old loop printed
+                # success while initialising nothing, and the new ids silently
+                # inherited unused reserved rows.
+                new_ids = [self.tokenizer.convert_tokens_to_ids(t) for t in new_tokens]
+                new_ids = [i for i in new_ids
+                           if isinstance(i, int) and 0 <= i < new_embeddings_size]
+
                 with torch.no_grad():
-                    embeddings = self.base_model.get_input_embeddings().weight
-                    mean_embedding = embeddings[:old_embeddings_size].mean(dim=0)
-                    # Add small noise for diversity
-                    for i in range(old_embeddings_size, new_embeddings_size):
-                        noise = torch.randn_like(mean_embedding) * 0.02
-                        embeddings[i] = (mean_embedding + noise).to(embeddings.dtype)
-                print("✓ Initialized new token embeddings")
+                    in_w = self.base_model.get_input_embeddings().weight
+                    keep = torch.ones(new_embeddings_size, dtype=torch.bool)
+                    if new_ids:
+                        keep[torch.tensor(new_ids, dtype=torch.long)] = False
+                    mean_embedding = in_w[keep].mean(dim=0)
+                    for i in new_ids:
+                        in_w[i] = (mean_embedding
+                                   + torch.randn_like(mean_embedding) * 0.02).to(in_w.dtype)
+
+                    # The untied output head needs the same treatment, or the
+                    # model can never assign probability to the new tokens.
+                    out_emb = self.base_model.get_output_embeddings()
+                    if out_emb is not None and out_emb.weight is not in_w:
+                        out_w = out_emb.weight
+                        out_mean = out_w[keep].mean(dim=0)
+                        for i in new_ids:
+                            out_w[i] = (out_mean
+                                        + torch.randn_like(out_mean) * 0.02).to(out_w.dtype)
+
+                print(f"✓ Initialized {len(new_ids)} new token embeddings")
             
             # Apply LoRA for fresh start
             self._lora_applied = False
@@ -1190,6 +1307,15 @@ class HARPOMTv2(nn.Module):
         self.maven = self.maven.to(target_device, dtype=model_dtype)
         self.vto_head = self.vto_head.to(target_device, dtype=model_dtype)
         self.recommendation_head = self.recommendation_head.to(target_device, dtype=model_dtype)
+        # Omitting these left the towers on CPU while the backbone sat on the
+        # accelerator, failing on any non-CPU device -- CUDA included.
+        # Retrieval heads stay float32 on a bf16 backbone: an AdamW step (~lr)
+        # is below bf16 resolution for most of their weights and is rounded
+        # away -- a popularity bias near 6 would never move at all.
+        for _name in ("retriever", "item_id_embedding", "item_bias", "reranker"):
+            _mod = getattr(self, _name, None)
+            if _mod is not None:
+                setattr(self, _name, _mod.to(target_device, dtype=torch.float32))
         
         # Store dtype for _reinit_components
         self._model_dtype = model_dtype
@@ -1223,7 +1349,10 @@ class HARPOMTv2(nn.Module):
                 task_type=TaskType.CAUSAL_LM,
                 # CRITICAL: Train embeddings for new special tokens!
                 # Without this, tokens like <|think|> remain random noise
-                modules_to_save=["embed_tokens", "lm_head"]
+                # ~40% of a 0.5B model becomes trainable (two 151k x hidden
+                # matrices), which dominates wall-clock on memory-bound devices.
+                modules_to_save=(None if getattr(self, "_skip_modules_to_save", False)
+                                 else ["embed_tokens", "lm_head"])
             )
             
             self.base_model = get_peft_model(self.base_model, lora_config)
@@ -1328,6 +1457,26 @@ class HARPOMTv2(nn.Module):
         else:
             print(f"  recommendation_head dimensions match ({hidden_size}), preserving weights")
             self.recommendation_head = self.recommendation_head.to(target_device, dtype=dtype)
+
+        # Retrieval modules were left out of both the resize and the device move,
+        # so they kept ModelConfig's default 3584 regardless of the backbone.
+        if getattr(self, "retriever", None) is not None:
+            cfg = self.retrieval_config
+            if self.retriever.hidden_size != hidden_size:
+                print(f"  Reinitializing retriever: {self.retriever.hidden_size} -> {hidden_size}")
+                self.retriever = TwoTowerRetriever(
+                    hidden_size, embed_dim=cfg.embed_dim, dropout=cfg.dropout,
+                    init_temperature=cfg.temperature)
+            # float32 regardless of backbone dtype; see load_base_model.
+            self.retriever = self.retriever.to(target_device, dtype=torch.float32)
+            if self.item_id_embedding is not None:
+                self.item_id_embedding = self.item_id_embedding.to(target_device, dtype=torch.float32)
+            if getattr(self, "item_bias", None) is not None:
+                self.item_bias = self.item_bias.to(target_device, dtype=torch.float32)
+            if self.reranker is not None:
+                if self.reranker.scorer[0].in_features != hidden_size * 4:
+                    self.reranker = CrossEncoderReranker(hidden_size, cfg.dropout)
+                self.reranker = self.reranker.to(target_device, dtype=torch.float32)
     
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -1361,6 +1510,12 @@ class HARPOMTv2(nn.Module):
         for param in self.bridge.parameters():
             param.requires_grad = True
             
+        for _mod in (self.retriever, self.item_id_embedding,
+                     getattr(self, "item_bias", None), self.reranker):
+            if _mod is not None:
+                for param in _mod.parameters():
+                    param.requires_grad = True
+
         print("✓ Frozen STAR, MAVEN, CHARM for SFT stage")
         print("✓ Training: base_model + vto_head + recommendation_head + BRIDGE")
     
@@ -1454,12 +1609,13 @@ class HARPOMTv2(nn.Module):
     
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
                 labels: Optional[torch.Tensor] = None,
-                domain: Domain = Domain.GENERAL,
+                domain: Union[Domain, torch.Tensor] = Domain.GENERAL,
                 vto_labels: Optional[torch.Tensor] = None,
                 use_star: bool = False,
                 use_maven: bool = False,
                 mode: str = "full",  # "full", "hidden_states", "charm_reward"
                 training_stage: str = None,  # "sft", "charm", "star", "maven" - controls which modules are used
+                context_mask: Optional[torch.Tensor] = None,
                 **kwargs) -> ModelOutput:
         """
         Forward pass with optional STAR reasoning and MAVEN collaboration.
@@ -1485,11 +1641,11 @@ class HARPOMTv2(nn.Module):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
+                logits_to_keep=1,  # hidden states only; skip full-vocab logits
                 **kwargs
             )
             # Return pooled hidden states (BRIDGE is applied explicitly in training code)
-            hidden_states = outputs.hidden_states[-1].mean(dim=1)
-            return hidden_states
+            return masked_mean_pool(outputs.hidden_states[-1], attention_mask)
         
         # Mode: Get CHARM rewards for given hidden states
         if mode == "charm_reward":
@@ -1509,6 +1665,14 @@ class HARPOMTv2(nn.Module):
         
         hidden_states = outputs.hidden_states[-1]
         device = input_ids.device
+
+        # Retrieval context: raw last-layer states over the dialogue tokens only.
+        # The SFT sequence also holds the reply, which names the target item in
+        # every ReDial example, and evaluation encodes the dialogue without
+        # BRIDGE. Pooling the BRIDGE features of the whole sequence trained the
+        # retriever to spot the answer in text it never sees at test time.
+        context_pooled = (masked_mean_pool(hidden_states, context_mask)
+                          if context_mask is not None else None)
         
         # Initialize outputs
         total_loss = outputs.loss if outputs.loss is not None else torch.tensor(0.0, device=device)
@@ -1525,12 +1689,13 @@ class HARPOMTv2(nn.Module):
             # This is essential for ranking evaluation to work!
             
             # Use BRIDGE for domain-invariant features
-            domain_id = torch.tensor([list(Domain).index(domain)] * input_ids.size(0), device=device)
-            bridge_out = self.bridge(hidden_states, domain, vto_labels=vto_labels)
+            domain_id = BRIDGE._as_domain_ids(domain, input_ids.size(0), device)
+            bridge_out = self.bridge(hidden_states, domain, vto_labels=vto_labels,
+                                     attention_mask=attention_mask)
             adapted_hidden = bridge_out["features"]
             
             # Pool adapted hidden states
-            pooled = adapted_hidden if adapted_hidden.dim() == 2 else adapted_hidden.mean(dim=1)
+            pooled = masked_mean_pool(adapted_hidden, attention_mask)
             
             # VTO prediction
             vto_logits = self.vto_head(pooled)
@@ -1557,20 +1722,21 @@ class HARPOMTv2(nn.Module):
             
             # Self-supervised recommendation head loss
             # Use LM confidence as target (higher confidence = better recommendation quality)
-            if outputs.loss is not None and outputs.loss.item() < 5.0:  # Avoid degenerate cases
-                # Convert LM loss to confidence: lower loss = higher confidence
-                lm_confidence = torch.exp(-outputs.loss).detach()
-                rec_target = lm_confidence.clamp(0.1, 0.9).expand_as(rec_scores)
-                rec_loss = F.mse_loss(torch.sigmoid(rec_scores), rec_target)
+            # outputs.loss is the batch-mean LM loss: expanding it gave every
+            # example the same target, so the head could only learn a constant.
+            if labels is not None and outputs.logits is not None:
+                rec_target = torch.exp(-self._per_example_nll(outputs.logits, labels))
+                rec_target = rec_target.clamp(0.1, 0.9).detach()
+                rec_loss = F.mse_loss(torch.sigmoid(rec_scores).squeeze(-1), rec_target)
                 total_loss = total_loss + 0.1 * rec_loss
                 
         elif training_stage == "charm":
             # CHARM: Use base_model + charm + BRIDGE for domain-aware preference learning
             # CRITICAL FIX: Use BRIDGE for domain adaptation during preference learning
-            domain_id = torch.tensor([list(Domain).index(domain)] * input_ids.size(0), device=device)
-            bridge_out = self.bridge(hidden_states, domain)
+            domain_id = BRIDGE._as_domain_ids(domain, input_ids.size(0), device)
+            bridge_out = self.bridge(hidden_states, domain, attention_mask=attention_mask)
             adapted_hidden = bridge_out["features"]
-            pooled = adapted_hidden if adapted_hidden.dim() == 2 else adapted_hidden.mean(dim=1)
+            pooled = masked_mean_pool(adapted_hidden, attention_mask)
             
             reward_result = self.charm(pooled, domain_id)
             
@@ -1581,14 +1747,14 @@ class HARPOMTv2(nn.Module):
             
         elif training_stage == "star":
             # STAR: Only use base_model + star for reasoning
-            pooled = hidden_states.mean(dim=1)
+            pooled = masked_mean_pool(hidden_states, attention_mask)
             reasoning_result = self.star(pooled, return_path=True)
             # STAR has its own loss computation in training loop
             
         elif training_stage == "maven":
             # MAVEN: Use base_model + maven + charm
-            pooled = hidden_states.mean(dim=1)
-            domain_id = torch.tensor([list(Domain).index(domain)] * input_ids.size(0), device=device)
+            pooled = masked_mean_pool(hidden_states, attention_mask)
+            domain_id = BRIDGE._as_domain_ids(domain, input_ids.size(0), device)
             maven_result = self.maven(pooled)
             pooled = maven_result["output"]
             reward_result = self.charm(pooled, domain_id)
@@ -1597,12 +1763,13 @@ class HARPOMTv2(nn.Module):
         else:
             # Full forward pass (inference or when training_stage is None)
             # BRIDGE: Domain adaptation
-            domain_id = torch.tensor([list(Domain).index(domain)] * input_ids.size(0), device=device)
-            bridge_out = self.bridge(hidden_states, domain, vto_labels=vto_labels)
+            domain_id = BRIDGE._as_domain_ids(domain, input_ids.size(0), device)
+            bridge_out = self.bridge(hidden_states, domain, vto_labels=vto_labels,
+                                     attention_mask=attention_mask)
             adapted_hidden = bridge_out["features"]
             
             # Pool for downstream tasks
-            pooled = adapted_hidden if adapted_hidden.dim() == 2 else adapted_hidden.mean(dim=1)
+            pooled = masked_mean_pool(adapted_hidden, attention_mask)
             
             # Optional STAR reasoning
             if use_star:
@@ -1637,7 +1804,8 @@ class HARPOMTv2(nn.Module):
                 'hidden_states': adapted_hidden,
                 'vto_logits': vto_logits,
                 'reward_scores': reward_result,
-                'reasoning_path': reasoning_result.get("reasoning_path") if reasoning_result else None
+                'reasoning_path': reasoning_result.get("reasoning_path") if reasoning_result else None,
+                'context_pooled': context_pooled
             }
         else:
             return ModelOutput(
@@ -1646,7 +1814,8 @@ class HARPOMTv2(nn.Module):
                 hidden_states=adapted_hidden,
                 vto_logits=vto_logits,
                 reward_scores=reward_result,
-                reasoning_path=reasoning_result.get("reasoning_path") if reasoning_result else None
+                reasoning_path=reasoning_result.get("reasoning_path") if reasoning_result else None,
+                context_pooled=context_pooled
             )
     
     def compute_preference_loss(self, chosen_input_ids: torch.Tensor,
@@ -1663,12 +1832,12 @@ class HARPOMTv2(nn.Module):
         chosen_out = self.base_model(chosen_input_ids, chosen_attention_mask, output_hidden_states=True)
         rejected_out = self.base_model(rejected_input_ids, rejected_attention_mask, output_hidden_states=True)
         
-        chosen_hidden = chosen_out.hidden_states[-1].mean(dim=1)
-        rejected_hidden = rejected_out.hidden_states[-1].mean(dim=1)
+        chosen_hidden = masked_mean_pool(chosen_out.hidden_states[-1], chosen_attention_mask)
+        rejected_hidden = masked_mean_pool(rejected_out.hidden_states[-1], rejected_attention_mask)
         
         # Use input tensor's device for DataParallel compatibility
         device = chosen_input_ids.device
-        domain_id = torch.tensor([list(Domain).index(domain)] * chosen_input_ids.size(0), device=device)
+        domain_id = BRIDGE._as_domain_ids(domain, chosen_input_ids.size(0), device)
         
         # CRITICAL FIX: Apply BRIDGE for domain-adapted features
         # This ensures preference learning uses the same feature space as SFT

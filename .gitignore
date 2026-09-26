@@ -72,3 +72,6 @@ Thumbs.db
 *.bak
 *.tmp
 *.temp
+
+# Raw ReDial (downloaded by scripts/convert_redial.py)
+redial_raw/

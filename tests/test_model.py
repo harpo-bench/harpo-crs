@@ -9,12 +9,12 @@ import sys
 import os
 
 # Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
 def test_imports():
     """Test that all modules can be imported."""
-    from config import (
+    from harpo.config import (
         VTO, Domain, AgentRole,
         ModelConfig, TrainingConfig,
         STARConfig, CHARMConfig, BRIDGEConfig, MAVENConfig,
@@ -27,7 +27,7 @@ def test_imports():
 
 def test_vto_categories():
     """Test VTO category mapping."""
-    from config import VTO, VTO_CATEGORIES, get_vto_category
+    from harpo.config import VTO, VTO_CATEGORIES, get_vto_category
     
     # Each VTO should belong to exactly one category
     all_vtos_in_categories = set()
@@ -41,16 +41,16 @@ def test_vto_categories():
 
 def test_model_config():
     """Test model configuration."""
-    from config import ModelConfig
+    from harpo.config import VTO, ModelConfig
     
     config = ModelConfig()
     assert config.hidden_size > 0
-    assert config.num_vtos == 24
+    assert len(VTO) == 21  # the paper's 21 VTOs; the model sizes its heads by len(VTO)
 
 
 def test_training_config():
     """Test training configuration."""
-    from config import TrainingConfig
+    from harpo.config import TrainingConfig
     
     config = TrainingConfig()
     assert config.sft_epochs > 0
@@ -61,7 +61,7 @@ def test_training_config():
 
 def test_special_tokens():
     """Test special token definitions."""
-    from config import SPECIAL_TOKENS
+    from harpo.config import SPECIAL_TOKENS
     
     assert "<|think|>" in SPECIAL_TOKENS.values()
     assert "<|/think|>" in SPECIAL_TOKENS.values()
@@ -70,7 +70,7 @@ def test_special_tokens():
 
 def test_domain_configs():
     """Test domain configurations exist."""
-    from config import Domain, DOMAIN_CONFIGS
+    from harpo.config import Domain, DOMAIN_CONFIGS
     
     for domain in Domain:
         assert domain in DOMAIN_CONFIGS
@@ -80,7 +80,7 @@ def test_domain_configs():
 
 def test_data_structures():
     """Test data structure creation."""
-    from config import (
+    from harpo.config import (
         Conversation, ConversationTurn, PreferencePair,
         Domain, VTO
     )
@@ -107,7 +107,7 @@ def test_data_structures():
 
 def test_evaluation_result():
     """Test evaluation result structure."""
-    from config import EvaluationResult, Domain
+    from harpo.config import EvaluationResult, Domain
     
     result = EvaluationResult(
         dataset="test",
@@ -127,11 +127,11 @@ class TestModelComponents:
     def test_bridge_init(self):
         """Test BRIDGE module can be created."""
         import torch
-        from config import BRIDGEConfig
+        from harpo.config import BRIDGEConfig
         
         # Only test if model.py can be imported
         try:
-            from model import BRIDGE
+            from harpo.model import BRIDGE
             
             config = BRIDGEConfig()
             bridge = BRIDGE(
@@ -143,7 +143,7 @@ class TestModelComponents:
             
             # Test forward pass with dummy input
             x = torch.randn(2, 256)
-            from config import Domain
+            from harpo.config import Domain
             output = bridge(x, Domain.MOVIES)
             
             assert "features" in output
@@ -156,8 +156,8 @@ class TestModelComponents:
         import torch
         
         try:
-            from model import CHARM
-            from config import CHARMConfig
+            from harpo.model import CHARM
+            from harpo.config import CHARMConfig
             
             config = CHARMConfig()
             charm = CHARM(
@@ -181,8 +181,8 @@ class TestModelComponents:
         import torch
         
         try:
-            from model import STAR
-            from config import STARConfig
+            from harpo.model import STAR
+            from harpo.config import STARConfig
             
             config = STARConfig()
             star = STAR(

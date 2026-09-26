@@ -30,7 +30,7 @@ os.environ["TORCH_COMPILE_DISABLE"] = "1"
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, default_collate
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
@@ -42,12 +42,35 @@ try:
 except:
     pass
 
-from config import VTO, Domain, ModelConfig, TrainingConfig, SPECIAL_TOKENS
-from model import HARPOMTv2, ModelOutput
+from .config import VTO, Domain, ModelConfig, TrainingConfig, SPECIAL_TOKENS
+from .model import HARPOMTv2, ModelOutput
+from .pooling import masked_mean_pool
+from .retrieval import CatalogSoftmax, NegativeQueue, build_item_index
+
+
+def token_subset_ce(logits: torch.Tensor, labels: torch.Tensor,
+                    token_ids: List[int]) -> torch.Tensor:
+    """Cross-entropy restricted to positions whose *target* is in ``token_ids``.
+
+    The causal shift matters and was missing: logits[:, t] predicts token t+1, so
+    the original flattened pairing of logits[t] with labels[t] trained the model
+    to emit each special token one position early, at weight 0.5.
+    """
+    if not token_ids:
+        return logits.new_zeros(())
+    shift_logits = logits[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    wanted = torch.zeros_like(shift_labels, dtype=torch.bool)
+    for tid in token_ids:
+        wanted |= shift_labels == tid
+    wanted &= shift_labels != -100
+    if not bool(wanted.any()):
+        return logits.new_zeros(())
+    return F.cross_entropy(shift_logits[wanted], shift_labels[wanted])
 
 # Import GPU optimization (optional - graceful fallback)
 try:
-    from gpu_config import (
+    from .gpu_config import (
         GPUConfig, detect_gpu_config, setup_gpu_environment,
         wrap_model_for_multi_gpu, get_model_for_saving,
         create_optimized_dataloader, get_amp_context, get_grad_scaler,
@@ -84,12 +107,18 @@ class SFTDataset(Dataset):
     2. Using proper tokenization that preserves the VTO pattern
     """
     
-    def __init__(self, data: List[Dict], tokenizer, max_length: int = 512):
+    def __init__(self, data: List[Dict], tokenizer, max_length: int = 512,
+                 item_index: Optional[Dict[str, int]] = None,
+                 item_max_length: int = 48):
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.vto_to_idx = {vto.value: i for i, vto in enumerate(VTO)}
         self.num_vtos = len(VTO)
+        # Catalogue index for the retriever's positive. Without it the retrieval
+        # objective is skipped and behaviour is unchanged for existing callers.
+        self.item_index = item_index or {}
+        self.item_max_length = item_max_length
         
         # ===== CRITICAL FIX #1: DISABLE CHAT TEMPLATE =====
         # Your data already has custom format like:
@@ -175,13 +204,60 @@ class SFTDataset(Dataset):
                 domain_idx = i
                 break
         
-        return {
+        batch = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "vto_labels": vto_labels,
-            "domain_idx": domain_idx
+            "domain_idx": domain_idx,
         }
+
+        gt_item = item.get("ground_truth_item")
+        if gt_item:
+            item_text = str(gt_item)
+            meta = item.get("item_metadata") or {}
+            for key in ("year", "genre", "director", "category", "brand"):
+                if meta.get(key):
+                    item_text += f" | {key}: {meta[key]}"
+            enc = self.tokenizer(item_text, max_length=self.item_max_length,
+                                 padding="max_length", truncation=True,
+                                 return_tensors="pt")
+            batch["item_input_ids"] = enc["input_ids"].squeeze(0)
+            batch["item_attention_mask"] = enc["attention_mask"].squeeze(0)
+            # -1 means "not in the catalogue": encode_item_embeddings falls back
+            # to content-only rather than indexing out of range.
+            batch["item_index"] = self.item_index.get(str(gt_item).lower(), -1)
+            batch["has_item"] = 1
+        else:
+            pad = torch.zeros(self.item_max_length, dtype=torch.long)
+            batch["item_input_ids"] = pad
+            batch["item_attention_mask"] = pad.clone()
+            batch["item_index"] = -1
+            batch["has_item"] = 0
+
+        return batch
+
+
+def trim_padding_collate(batch):
+    """Collate, then drop columns that are padding in every row of the batch.
+
+    SFTDataset pads to ``max_length``, so a batch of short dialogues still paid
+    for a full-length forward; on ReDial (median ~190 of 256 tokens) about a
+    quarter of all compute was padding.
+    """
+    out = default_collate(batch)
+    for mask_key, keys in (("attention_mask", ("input_ids", "attention_mask", "labels")),
+                           ("item_attention_mask", ("item_input_ids", "item_attention_mask"))):
+        if mask_key not in out:
+            continue
+        live = out[mask_key].bool().any(dim=0).nonzero().flatten()
+        if live.numel() == 0:
+            continue
+        start, end = int(live[0]), int(live[-1]) + 1
+        for key in keys:
+            if key in out:
+                out[key] = out[key][:, start:end]
+    return out
 
 
 class PreferenceDataset(Dataset):
@@ -387,8 +463,11 @@ class HARPOMTv2Trainer:
     - HuggingFace Accelerate (recommended for multi-GPU)
     - DataParallel (fallback)
     """
-    
-    def __init__(self, model: HARPOMTv2, config: TrainingConfig, 
+
+    # Saved and restored with the other components; absent ones are skipped.
+    RETRIEVAL_COMPONENTS = ("retriever", "item_id_embedding", "item_bias", "reranker")
+
+    def __init__(self, model: HARPOMTv2, config: TrainingConfig,
                  device: str = None, gpu_config: 'GPUConfig' = None,
                  accelerator = None):
         self.model = model
@@ -398,6 +477,8 @@ class HARPOMTv2Trainer:
         self._is_dataparallel = False  # Only True when using torch DataParallel
         self._use_accelerate = False   # True when using HuggingFace Accelerate
         self._model_prepared = False   # Track if model has been prepared with Accelerate
+        self._catalog_softmax = None   # set by attach_catalog()
+        self._catalog_refresh_every = 400
         
         # Priority: Accelerate > gpu_config/DataParallel > single GPU
         if accelerator is not None:
@@ -467,6 +548,65 @@ class HARPOMTv2Trainer:
             return self.model.module
         return self.model
     
+    def attach_catalog(self, item_texts, item_index, refresh_every: int = 400,
+                       item_max_length: int = 32, encode_batch_size: int = 64,
+                       item_counts=None):
+        """Enable the full-catalogue softmax objective for Stage 1.
+
+        Without it the retrieval objective only ever sees in-batch negatives --
+        3 at batch 4 -- while evaluation ranks against thousands. That gap is why
+        in-batch accuracy reached 0.66 while full-catalogue R@10 sat at chance.
+        """
+        base_model = self._get_base_model()
+        if getattr(base_model, "retriever", None) is None:
+            print("  Catalogue objective skipped: retrieval is disabled")
+            return
+        self._catalog_texts = list(item_texts)
+        self._catalog_refresh_every = max(1, refresh_every)
+        self._catalog_item_max_length = item_max_length
+        self._catalog_encode_batch = encode_batch_size
+        self._catalog_softmax = CatalogSoftmax(
+            base_model.retriever, base_model.item_id_embedding,
+            num_items=len(self._catalog_texts),
+            id_weight=base_model.retrieval_config.id_embedding_weight,
+            item_bias=getattr(base_model, "item_bias", None),
+        ).to(self.device)
+        print(f"  Catalogue objective ON: softmax over {len(self._catalog_texts)} "
+              f"items, content refreshed every {self._catalog_refresh_every} steps")
+
+        bias = getattr(base_model, "item_bias", None)
+        if bias is not None and item_counts is not None:
+            # log(count + 1): the softmax of the bias alone is the (add-one
+            # smoothed) training popularity distribution.
+            counts = torch.as_tensor(list(item_counts), dtype=torch.float32)
+            with torch.no_grad():
+                bias.weight.zero_()
+                bias.weight[:len(counts), 0] = torch.log1p(counts).to(bias.weight.device)
+            print(f"  Item bias initialised to log popularity "
+                  f"({int((counts > 0).sum())}/{len(counts)} items seen in training)")
+
+    @torch.no_grad()
+    def _refresh_catalog_content(self):
+        """Re-encode item text through the backbone into the cached matrix."""
+        base_model = self._get_base_model()
+        was_training = base_model.training
+        base_model.eval()
+        try:
+            chunks, step = [], self._catalog_encode_batch
+            for start in range(0, len(self._catalog_texts), step):
+                enc = base_model.tokenizer(
+                    self._catalog_texts[start:start + step], return_tensors="pt",
+                    padding=True, truncation=True,
+                    max_length=self._catalog_item_max_length).to(self.device)
+                out = base_model.base_model(
+                    input_ids=enc["input_ids"], attention_mask=enc["attention_mask"],
+                    output_hidden_states=True, logits_to_keep=1)
+                pooled = masked_mean_pool(out.hidden_states[-1], enc["attention_mask"])
+                chunks.append(base_model.retriever.encode_item(pooled))
+            self._catalog_softmax.set_content(torch.cat(chunks, dim=0))
+        finally:
+            base_model.train(was_training)
+
     def _handle_model_output(self, outputs):
         """Handle model output, averaging loss across GPUs if needed."""
         if self._is_dataparallel and isinstance(outputs, dict):
@@ -512,8 +652,9 @@ class HARPOMTv2Trainer:
                 batch_size=self.config.batch_size,
                 shuffle=shuffle,
                 num_workers=8,  # OPTIMIZED: Increased from 4
-                pin_memory=True,
+                pin_memory=str(self.device).startswith('cuda'),
                 drop_last=drop_last,
+                collate_fn=trim_padding_collate,
                 prefetch_factor=4,  # OPTIMIZED: Added prefetch
                 persistent_workers=True  # OPTIMIZED: Keep workers alive
             )
@@ -529,8 +670,11 @@ class HARPOMTv2Trainer:
                 batch_size=self.config.batch_size,
                 shuffle=shuffle,
                 num_workers=4,  # Use some workers even without gpu_config
-                pin_memory=True,
-                drop_last=drop_last
+                # Pinning is CUDA-only; on MPS it only emits a warning.
+                pin_memory=str(self.device).startswith('cuda'),
+                persistent_workers=True,
+                drop_last=drop_last,
+                collate_fn=trim_padding_collate,
             )
     
     def _get_amp_context(self):
@@ -573,7 +717,8 @@ class HARPOMTv2Trainer:
         self.optimizer.zero_grad()
     
     def train_sft(self, train_dataset: SFTDataset, 
-                  eval_dataset: Optional[SFTDataset] = None) -> List[Dict]:
+                  eval_dataset: Optional[SFTDataset] = None,
+                  epoch_end_callback=None) -> List[Dict]:
         """Stage 1: Supervised Fine-Tuning
         
         CRITICAL FIX: Added special token loss AND VTO content loss to ensure 
@@ -625,11 +770,24 @@ class HARPOMTv2Trainer:
         # CRITICAL FIX: Get special token IDs for auxiliary loss
         base_model = self._get_base_model()
         tokenizer = base_model.tokenizer
+        # These losses ask the model to emit specific token ids, which is only
+        # achievable if embed_tokens/lm_head are trainable. Under LoRA alone they
+        # are frozen, so the objective has an unreachable optimum: measured on
+        # Qwen2.5-0.5B it starts at 17.6 nats and plateaus at 8.3, weighted 0.5 --
+        # a large permanent gradient that diverged epoch 1 into NaN.
+        embeddings_trainable = any(
+            p.requires_grad for n, p in base_model.base_model.named_parameters()
+            if "embed_tokens" in n or "lm_head" in n
+        )
+        if not embeddings_trainable:
+            print("  Token-level aux losses DISABLED: embed_tokens/lm_head frozen, "
+                  "so special-token targets are unreachable")
+
         special_token_ids = set()
         for token in ["<|think|>", "<|/think|>", "<|tool_start|>", "<|tool_end|>"]:
             ids = tokenizer.encode(token, add_special_tokens=False)
             special_token_ids.update(ids)
-        special_token_ids = list(special_token_ids)
+        special_token_ids = list(special_token_ids) if embeddings_trainable else []
         print(f"  Special tokens to emphasize: {len(special_token_ids)} token IDs")
         
         # NEW: Get VTO name token IDs for additional supervision
@@ -640,17 +798,44 @@ class HARPOMTv2Trainer:
         for vto_name in vto_names:
             ids = tokenizer.encode(vto_name, add_special_tokens=False)
             vto_token_ids.update(ids)
-        vto_token_ids = list(vto_token_ids)
+        vto_token_ids = list(vto_token_ids) if embeddings_trainable else []
         print(f"  VTO content tokens to emphasize: {len(vto_token_ids)} token IDs")
         
+        retrieval_cfg = getattr(self.config, "retrieval_config", None)
+        retriever_enabled = (retrieval_cfg is not None and retrieval_cfg.enabled
+                             and getattr(base_model, "retriever", None) is not None)
+        retrieval_weight = retrieval_cfg.loss_weight if retrieval_cfg else 0.0
+
+        # Cross-batch negatives: at batch 4 the in-batch objective sees only 3
+        # negatives against a catalogue of thousands.
+        negative_queue = None
+        if retriever_enabled and retrieval_cfg.num_hard_negatives > 0:
+            negative_queue = NegativeQueue(
+                embed_dim=retrieval_cfg.embed_dim,
+                capacity=max(1024, 128 * retrieval_cfg.num_hard_negatives))
+        if retriever_enabled:
+            print(f"  Retrieval objective ON (weight {retrieval_weight}, "
+                  f"item repr '{retrieval_cfg.item_representation}')")
+
+        catalog_softmax = self._catalog_softmax
+        catalog_ready = False
+
         self.model.train()
         global_step = 0
-        
+
         for epoch in range(self.config.sft_epochs):
-            epoch_loss = 0.0
-            epoch_special_loss = 0.0
-            epoch_vto_content_loss = 0.0
+            # On-device accumulators reduced once per epoch. Five .item() calls
+            # per step drained the MPS queue and held utilisation near 2%.
+            _dev = self.device
+            epoch_loss = torch.zeros((), device=_dev)
+            epoch_special_loss = torch.zeros((), device=_dev)
+            epoch_vto_content_loss = torch.zeros((), device=_dev)
+            epoch_retrieval_acc = torch.zeros((), device=_dev)
+            epoch_catalog_rank = torch.zeros((), device=_dev)
+            epoch_catalog_acc = torch.zeros((), device=_dev)
             num_batches = 0
+            nan_steps = 0
+            catalog_batches = 0
             
             pbar = tqdm(train_loader, desc=f"SFT Epoch {epoch + 1}/{self.config.sft_epochs}")
             
@@ -676,7 +861,10 @@ class HARPOMTv2Trainer:
                         labels=batch["labels"],
                         domain=domain,
                         vto_labels=batch["vto_labels"],
-                        training_stage="sft"  # Only use base_model + vto_head
+                        training_stage="sft",  # Only use base_model + vto_head
+                        # Dialogue tokens only (labels mask the prompt), so the
+                        # retriever sees what evaluation sees.
+                        context_mask=batch["attention_mask"] * (batch["labels"] == -100)
                     )
                     outputs = self._handle_model_output(outputs)
                     
@@ -690,51 +878,87 @@ class HARPOMTv2Trainer:
                     vto_content_loss = torch.tensor(0.0, device=batch_device, dtype=base_loss.dtype)
                     
                     if outputs.logits is not None:
-                        labels = batch["labels"]
-                        valid_mask = labels != -100
-                        
-                        if valid_mask.any():
-                            # Extra cross-entropy loss for special tokens (weighted higher)
-                            if len(special_token_ids) > 0:
-                                special_mask = torch.zeros_like(labels, dtype=torch.bool)
-                                for token_id in special_token_ids:
-                                    special_mask = special_mask | (labels == token_id)
-                                
-                                special_positions = special_mask & valid_mask
-                                
-                                if special_positions.any():
-                                    logits = outputs.logits
-                                    flat_logits = logits.view(-1, logits.size(-1))
-                                    flat_labels = labels.view(-1)
-                                    flat_mask = special_positions.view(-1)
-                                    
-                                    if flat_mask.any():
-                                        special_logits = flat_logits[flat_mask]
-                                        special_labels = flat_labels[flat_mask]
-                                        special_loss = F.cross_entropy(special_logits, special_labels)
-                            
-                            # NEW: Extra cross-entropy loss for VTO content tokens
-                            # This ensures the model learns VTO names properly
-                            if len(vto_token_ids) > 0:
-                                vto_mask = torch.zeros_like(labels, dtype=torch.bool)
-                                for token_id in vto_token_ids:
-                                    vto_mask = vto_mask | (labels == token_id)
-                                
-                                vto_positions = vto_mask & valid_mask
-                                
-                                if vto_positions.any():
-                                    logits = outputs.logits
-                                    flat_logits = logits.view(-1, logits.size(-1))
-                                    flat_labels = labels.view(-1)
-                                    flat_mask = vto_positions.view(-1)
-                                    
-                                    if flat_mask.any():
-                                        vto_logits = flat_logits[flat_mask]
-                                        vto_labels_flat = flat_labels[flat_mask]
-                                        vto_content_loss = F.cross_entropy(vto_logits, vto_labels_flat)
-                    
+                        # Causally shifted inside token_subset_ce; the previous
+                        # inline version compared logits[t] with labels[t].
+                        special_loss = token_subset_ce(
+                            outputs.logits, batch["labels"], special_token_ids)
+                        vto_content_loss = token_subset_ce(
+                            outputs.logits, batch["labels"], vto_token_ids)
+
+                    # ===== Retrieval objective (in-batch + queue) =====
+                    retrieval_loss = torch.tensor(0.0, device=batch_device,
+                                                  dtype=base_loss.dtype)
+                    retrieval_acc = torch.zeros((), device=batch_device)
+                    if retriever_enabled and int(batch.get("has_item", torch.zeros(1)).sum()) >= 2:
+                        keep = batch["has_item"].bool()
+                        item_hidden = self.model(
+                            input_ids=batch["item_input_ids"][keep],
+                            attention_mask=batch["item_attention_mask"][keep],
+                            mode="hidden_states")
+                        ctx_hidden = outputs.context_pooled[keep]
+                        idx = batch["item_index"][keep]
+
+                        item_embeds = base_model.encode_item_embeddings(item_hidden, idx)
+                        ctx_embeds = base_model.retriever.encode_context(ctx_hidden)
+                        logits = (ctx_embeds @ item_embeds.t()) / base_model.retriever.temperature
+
+                        # Mask duplicate positives: a few titles dominate ReDial,
+                        # and otherwise a repeated item is pushed away from itself.
+                        dup = (idx.unsqueeze(0) == idx.unsqueeze(1)) & (idx.unsqueeze(0) >= 0)
+                        dup &= ~torch.eye(dup.size(0), dtype=torch.bool, device=dup.device)
+                        logits = logits.masked_fill(dup, torch.finfo(logits.dtype).min)
+
+                        if (negative_queue is not None
+                                and epoch >= retrieval_cfg.hard_negative_start_epoch
+                                and len(negative_queue) > 0):
+                            hard = negative_queue.sample_hard(
+                                ctx_embeds, retrieval_cfg.num_hard_negatives,
+                                exclude=idx, debias=retrieval_cfg.popularity_debias)
+                            if hard is not None:
+                                hl = torch.einsum("bd,bnd->bn", ctx_embeds,
+                                                  hard.to(ctx_embeds.dtype))
+                                logits = torch.cat(
+                                    [logits, hl / base_model.retriever.temperature], dim=1)
+
+                        targets = torch.arange(logits.size(0), device=logits.device)
+                        retrieval_loss = F.cross_entropy(logits, targets)
+                        retrieval_acc = (logits.argmax(1) == targets).float().mean().detach()
+                        if negative_queue is not None:
+                            negative_queue.enqueue(item_embeds, idx)
+
+                    # ===== Full-catalogue softmax: the objective the metric measures
+                    catalog_loss = torch.tensor(0.0, device=batch_device,
+                                                dtype=base_loss.dtype)
+                    if catalog_softmax is not None:
+                        if (not catalog_ready
+                                or num_batches % self._catalog_refresh_every == 0):
+                            self._refresh_catalog_content()
+                            catalog_ready = True
+                        cat_out = catalog_softmax(
+                            outputs.context_pooled, batch["item_index"].to(batch_device))
+                        catalog_loss = cat_out["loss"]
+                        epoch_catalog_rank = epoch_catalog_rank + cat_out["rank"]
+                        epoch_catalog_acc = epoch_catalog_acc + cat_out["accuracy"]
+                        catalog_batches += 1
+
                     # Total loss with special token AND VTO content emphasis
-                    total_loss = base_loss + 0.5 * special_loss + 0.3 * vto_content_loss
+                    total_loss = (base_loss + 0.5 * special_loss
+                                  + 0.3 * vto_content_loss
+                                  + retrieval_weight * retrieval_loss
+                                  + retrieval_weight * catalog_loss)
+
+                    # Attribute non-finite losses rather than averaging a NaN into
+                    # the epoch and reporting only "Avg Loss: nan".
+                    if not torch.isfinite(total_loss):
+                        parts = {"lm": base_loss, "special": special_loss,
+                                 "vto": vto_content_loss,
+                                 "retrieval": retrieval_loss, "catalog": catalog_loss}
+                        bad = [k for k, v in parts.items() if not torch.isfinite(v)]
+                        print(f"\n  !! non-finite loss at epoch {epoch} step "
+                              f"{batch_idx}: {bad or ['sum']}")
+                        nan_steps += 1
+                        self.optimizer.zero_grad(set_to_none=True)
+                        continue
                 
                 loss = total_loss / grad_accum
                 self._backward_with_scaler(loss)
@@ -743,26 +967,47 @@ class HARPOMTv2Trainer:
                     self._optimizer_step_with_scaler()
                     global_step += 1
                 
-                epoch_loss += base_loss.item()
-                epoch_special_loss += special_loss.item() if isinstance(special_loss, torch.Tensor) and special_loss.numel() > 0 else 0
-                epoch_vto_content_loss += vto_content_loss.item() if isinstance(vto_content_loss, torch.Tensor) and vto_content_loss.numel() > 0 else 0
+                epoch_loss = epoch_loss + base_loss.detach()
+                epoch_special_loss = epoch_special_loss + special_loss.detach()
+                epoch_vto_content_loss = epoch_vto_content_loss + vto_content_loss.detach()
+                epoch_retrieval_acc = epoch_retrieval_acc + retrieval_acc
                 num_batches += 1
-                pbar.set_postfix({"loss": epoch_loss / num_batches, "vto": epoch_vto_content_loss / max(num_batches, 1)})
+                if num_batches % 50 == 0:
+                    pbar.set_postfix({"loss": f"{epoch_loss.item()/num_batches:.3f}"})
                 
                 if self.gpu_config and self.gpu_config.empty_cache_freq > 0:
                     if (batch_idx + 1) % self.gpu_config.empty_cache_freq == 0:
                         clear_gpu_memory()
             
-            avg_loss = epoch_loss / num_batches
-            avg_special = epoch_special_loss / max(num_batches, 1)
-            avg_vto_content = epoch_vto_content_loss / max(num_batches, 1)
-            self.train_losses.append({"epoch": epoch, "stage": "sft", "loss": avg_loss, "special_loss": avg_special, "vto_content_loss": avg_vto_content})
+            avg_loss = epoch_loss.item() / max(num_batches, 1)
+            avg_special = epoch_special_loss.item() / max(num_batches, 1)
+            avg_vto_content = epoch_vto_content_loss.item() / max(num_batches, 1)
+            self.train_losses.append({
+                "epoch": epoch, "stage": "sft", "loss": avg_loss,
+                "special_loss": avg_special, "vto_content_loss": avg_vto_content,
+                "retrieval_acc": epoch_retrieval_acc.item() / max(num_batches, 1),
+                "catalog_rank": (epoch_catalog_rank.item() / catalog_batches
+                                 if catalog_batches else None),
+                "catalog_acc": (epoch_catalog_acc.item() / catalog_batches
+                                if catalog_batches else None),
+                "nan_steps": nan_steps,
+            })
+            if catalog_batches:
+                print(f"  catalogue: mean rank "
+                      f"{epoch_catalog_rank.item()/catalog_batches:.1f} / "
+                      f"{catalog_softmax.num_items}, top-1 "
+                      f"{100*epoch_catalog_acc.item()/catalog_batches:.2f}%")
             print(f"Epoch {epoch + 1} - Avg Loss: {avg_loss:.4f}, Special Token Loss: {avg_special:.4f}, VTO Content Loss: {avg_vto_content:.4f}")
             
             if eval_dataset:
                 eval_metrics = self.evaluate_sft(eval_dataset)
                 self.eval_metrics.append({"epoch": epoch, "stage": "sft", **eval_metrics})
                 print(f"  Eval Loss: {eval_metrics['eval_loss']:.4f}, VTO Acc: {eval_metrics['vto_accuracy']:.4f}")
+
+            # e.g. a full ranking evaluation, so results exist per epoch even if
+            # a long run is cut short.
+            if epoch_end_callback is not None:
+                epoch_end_callback(epoch, self.train_losses[-1])
         
         self.save_checkpoint("sft_final")
         
@@ -1224,6 +1469,11 @@ class HARPOMTv2Trainer:
             "maven_state_dict": base_model.maven.state_dict(),
             "vto_head_state_dict": base_model.vto_head.state_dict(),
             "recommendation_head_state_dict": base_model.recommendation_head.state_dict(),
+            # The retrieval heads produce every ranking score; a checkpoint
+            # without them cannot be evaluated.
+            **{f"{name}_state_dict": module.state_dict()
+               for name in self.RETRIEVAL_COMPONENTS
+               if (module := getattr(base_model, name, None)) is not None},
             "train_losses": self.train_losses,
             "eval_metrics": self.eval_metrics
         }, components_path)
@@ -1302,7 +1552,8 @@ class HARPOMTv2Trainer:
             ("maven", "maven_state_dict"),
             ("vto_head", "vto_head_state_dict"),
             ("recommendation_head", "recommendation_head_state_dict"),
-        ]
+        ] + [(name, f"{name}_state_dict") for name in self.RETRIEVAL_COMPONENTS
+             if getattr(base_model, name, None) is not None]
         
         for component_name, state_dict_key in components:
             if state_dict_key in checkpoint:

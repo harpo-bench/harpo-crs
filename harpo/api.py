@@ -7,8 +7,8 @@ Provides clean, modular interfaces for scoring, comparing, and explaining output
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 import torch
-from model import HARPOMTv2
-from evaluation import (
+from .model import HARPOMTv2
+from .evaluation import (
     recall_at_k, mrr_at_k, ndcg_at_k, hit_rate_at_k
 )
 

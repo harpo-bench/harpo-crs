@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import torch
-from api import Evaluator, Comparator, Explainer
+from .api import Evaluator, Comparator, Explainer
 
 
 app = FastAPI(

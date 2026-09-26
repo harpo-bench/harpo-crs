@@ -11,7 +11,7 @@ import os
 import sys
 
 # Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -52,8 +52,8 @@ def main():
         print(f"ERROR: base_model not found: {base_model_path}")
         sys.exit(1)
     
-    from config import ModelConfig, TrainingConfig
-    from model import HARPOMTv2
+    from harpo.config import ModelConfig, TrainingConfig
+    from harpo.model import HARPOMTv2
     
     model_config = ModelConfig(model_name=base_model_path)
     training_config = TrainingConfig()

@@ -18,7 +18,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import asdict
 from tqdm import tqdm
 
-from config import (
+from .config import (
     VTO, VTO_DESCRIPTIONS, Domain, DOMAIN_CONFIGS,
     Conversation, ConversationTurn, ToolCall, PreferencePair,
     SPECIAL_TOKENS, VTO_ANNOTATION_PROMPT, CHARM_PREFERENCE_PROMPT

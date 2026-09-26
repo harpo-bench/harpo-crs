@@ -11,7 +11,7 @@ import click
 import json
 from pathlib import Path
 from typing import Optional
-from api import Evaluator, Comparator, Explainer
+from .api import Evaluator, Comparator, Explainer
 
 
 @click.group()

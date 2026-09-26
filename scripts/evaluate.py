@@ -20,7 +20,7 @@ import sys
 from datetime import datetime
 
 # Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -121,8 +121,8 @@ def main():
     # Load model
     print("\n[Step 2] Loading model...")
     
-    from config import ModelConfig, TrainingConfig
-    from model import HARPOMTv2
+    from harpo.config import ModelConfig, TrainingConfig
+    from harpo.model import HARPOMTv2
     
     model_config = ModelConfig(model_name=base_model_path)
     training_config = TrainingConfig()
@@ -158,7 +158,7 @@ def main():
     # Run evaluation
     print("\n[Step 3] Running evaluation...")
     
-    from evaluation import HARPOMTv2Evaluator
+    from harpo.evaluation import HARPOMTv2Evaluator
     
     eval_cache_dir = os.path.join(args.output, "eval_cache")
     os.makedirs(eval_cache_dir, exist_ok=True)

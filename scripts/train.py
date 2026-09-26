@@ -25,7 +25,7 @@ import sys
 from datetime import datetime
 
 # Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
@@ -152,7 +152,7 @@ def main():
     # Handle resume
     print("\n[Step 3] Starting training...")
     
-    from training import run_full_training
+    from harpo.training import run_full_training
     
     skip_stages = list(args.skip_stages) if args.skip_stages else []
     resume_checkpoint = None
@@ -187,7 +187,7 @@ def main():
     # Try GPU config
     gpu_config = None
     try:
-        from gpu_config import detect_gpu_config
+        from harpo.gpu_config import detect_gpu_config
         gpu_config = detect_gpu_config()
     except ImportError:
         pass
@@ -209,7 +209,7 @@ def main():
     
     actual_model = model.module if hasattr(model, 'module') else model
     
-    from evaluation import HARPOMTv2Evaluator
+    from harpo.evaluation import HARPOMTv2Evaluator
     
     eval_cache_dir = os.path.join(args.output, "eval_cache")
     os.makedirs(eval_cache_dir, exist_ok=True)

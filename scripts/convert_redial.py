@@ -445,6 +445,23 @@ def extract_movie_mentions(text: str, movie_map: Dict[str, str]) -> List[str]:
     return movies
 
 
+YEAR_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<year>(?:19|20)\d{2})\)\s*$")
+
+
+def item_metadata_for(title: str) -> Dict[str, str]:
+    """Structured metadata for an item title.
+
+    ReDial encodes the release year in the title itself ("Inception (2010)").
+    Pulling it out gives the item tower a real field and lets two films sharing
+    a title be told apart -- otherwise near-duplicates become each other's
+    negatives.
+    """
+    if not title:
+        return {}
+    m = YEAR_RE.match(title.strip())
+    return {"year": m.group("year")} if m else {}
+
+
 def build_movie_database(train_data: List[Dict], test_data: List[Dict]) -> Dict[str, str]:
     """Build movie ID to name mapping from all conversations"""
     movie_db = {}
@@ -651,6 +668,8 @@ def create_sft_examples(utterance_infos: List[Dict]) -> List[Dict]:
             "movies_mentioned": info["movies_in_msg"],
             "all_conversation_movies": info["conversation_movies"],
             "ground_truth_item": info["movies_in_msg"][0] if info["movies_in_msg"] else None,
+            "item_metadata": item_metadata_for(
+                info["movies_in_msg"][0] if info["movies_in_msg"] else ""),
             "satisfaction_score": 4.0 if info["movies_in_msg"] else 3.5
         })
     
